@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"math"
 	"os"
@@ -14,7 +15,7 @@ import (
 	locationid "github.com/ruckstackapp/locationid/go"
 )
 
-const persistedVersion = 2
+const persistedVersion = 3
 const defaultSpatialCellPrecision = 14
 const defaultHotSpatialCellThreshold = 4096
 const refinedSpatialCellExtraPrecision = 2
@@ -27,6 +28,7 @@ var (
 	ErrDuplicateID        = errors.New("duplicate record id")
 	ErrNotFound           = errors.New("record not found")
 	ErrUnsupportedVersion = errors.New("unsupported index file version")
+	ErrCorruptIndex       = errors.New("corrupt index file")
 )
 
 type RecordID string
@@ -249,7 +251,12 @@ func Load(path string) (*LocationIndex, error) {
 	}
 	defer file.Close()
 
-	return loadIndex(file)
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	return loadIndex(file, info.Size())
 }
 
 func prefixes(payload string) []string {
@@ -510,22 +517,50 @@ func (idx *LocationIndex) SearchNearestDetailed(lat, lon float64, limit int, opt
 }
 
 func (idx *LocationIndex) Save(path string) error {
-	file, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
 	records := make([]IndexedRecord, 0, len(idx.Records))
 	for _, id := range sortedRecordIDsFromDocIDs(idx.recordsByDocID) {
 		records = append(records, idx.Records[id])
 	}
 
-	if err := saveIndex(file, idx, records); err != nil {
+	return writeAtomically(path, func(file *os.File) error {
+		if err := saveIndex(file, idx, records); err != nil {
+			return err
+		}
+		return file.Sync()
+	})
+}
+
+func writeAtomically(path string, write func(file *os.File) error) error {
+	dir := filepathDir(path)
+	tempFile, err := os.CreateTemp(dir, ".locationindex-*")
+	if err != nil {
 		return err
 	}
+	tempPath := tempFile.Name()
+	defer func() {
+		tempFile.Close()
+		_ = os.Remove(tempPath)
+	}()
 
-	return file.Sync()
+	if err := write(tempFile); err != nil {
+		return err
+	}
+	if err := tempFile.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tempPath, path)
+}
+
+func filepathDir(path string) string {
+	for i := len(path) - 1; i >= 0; i-- {
+		if path[i] == '/' {
+			if i == 0 {
+				return "/"
+			}
+			return path[:i]
+		}
+	}
+	return "."
 }
 
 func (idx *LocationIndex) filterByLabels(ids Set[docID], labels []Label) Set[docID] {
@@ -1175,60 +1210,70 @@ func saveIndex(writer io.Writer, idx *LocationIndex, records []IndexedRecord) er
 	if err := binary.Write(buffered, binary.BigEndian, uint32(persistedVersion)); err != nil {
 		return err
 	}
-	if err := binary.Write(buffered, binary.BigEndian, uint32(idx.Options.SpatialCellPrecision)); err != nil {
+	bodyChecksum := crc32.NewIEEE()
+	bodyWriter := io.MultiWriter(buffered, bodyChecksum)
+
+	if err := binary.Write(bodyWriter, binary.BigEndian, uint32(idx.Options.SpatialCellPrecision)); err != nil {
 		return err
 	}
-	if err := binary.Write(buffered, binary.BigEndian, uint32(idx.Options.HotSpatialCellThreshold)); err != nil {
+	if err := binary.Write(bodyWriter, binary.BigEndian, uint32(idx.Options.HotSpatialCellThreshold)); err != nil {
 		return err
 	}
 
-	if err := binary.Write(buffered, binary.BigEndian, uint32(len(records))); err != nil {
+	if err := binary.Write(bodyWriter, binary.BigEndian, uint32(len(records))); err != nil {
 		return err
 	}
 
 	for _, record := range records {
 		docID := idx.docIDsByRecord[record.ID]
-		if err := binary.Write(buffered, binary.BigEndian, uint32(docID)); err != nil {
+		if err := binary.Write(bodyWriter, binary.BigEndian, uint32(docID)); err != nil {
 			return err
 		}
-		if err := writeRecord(buffered, record); err != nil {
+		if err := writeRecord(bodyWriter, record); err != nil {
 			return err
 		}
-		if err := writeDecodedLocation(buffered, idx.decodedRecords[docID]); err != nil {
+		if err := writeDecodedLocation(bodyWriter, idx.decodedRecords[docID]); err != nil {
 			return err
 		}
 	}
 
-	if err := writeDocIDSetMap(buffered, idx.ByPayload); err != nil {
+	if err := writeDocIDSetMap(bodyWriter, idx.ByPayload); err != nil {
 		return err
 	}
-	if err := writeLabelDocIDSetMap(buffered, idx.ByLabel); err != nil {
+	if err := writeLabelDocIDSetMap(bodyWriter, idx.ByLabel); err != nil {
 		return err
 	}
-	if err := writeDocIDSetMap(buffered, idx.ByPayloadPrefix); err != nil {
+	if err := writeDocIDSetMap(bodyWriter, idx.ByPayloadPrefix); err != nil {
 		return err
 	}
-	if err := writeDocIDSetMap(buffered, idx.bySpatialPrefix); err != nil {
+	if err := writeDocIDSetMap(bodyWriter, idx.bySpatialPrefix); err != nil {
 		return err
 	}
-	if err := writeDocIDSetMap(buffered, idx.bySpatialCell); err != nil {
+	if err := writeDocIDSetMap(bodyWriter, idx.bySpatialCell); err != nil {
 		return err
 	}
-	if err := writeDocIDSetMap(buffered, idx.byRefinedSpatialCell); err != nil {
+	if err := writeDocIDSetMap(bodyWriter, idx.byRefinedSpatialCell); err != nil {
 		return err
 	}
-	if err := writeDocIDSetMap(buffered, idx.byHotSpatialFallback); err != nil {
+	if err := writeDocIDSetMap(bodyWriter, idx.byHotSpatialFallback); err != nil {
 		return err
 	}
-	if err := writeStringSet(buffered, idx.hotSpatialCells); err != nil {
+	if err := writeStringSet(bodyWriter, idx.hotSpatialCells); err != nil {
+		return err
+	}
+	if err := binary.Write(buffered, binary.BigEndian, bodyChecksum.Sum32()); err != nil {
 		return err
 	}
 
 	return buffered.Flush()
 }
 
-func loadIndex(reader io.Reader) (*LocationIndex, error) {
-	buffered := bufio.NewReader(reader)
+func loadIndex(file *os.File, size int64) (*LocationIndex, error) {
+	if size < 8 {
+		return nil, ErrCorruptIndex
+	}
+
+	buffered := bufio.NewReader(file)
 	magic := [4]byte{}
 	if _, err := io.ReadFull(buffered, magic[:]); err != nil {
 		return nil, err
@@ -1244,9 +1289,21 @@ func loadIndex(reader io.Reader) (*LocationIndex, error) {
 	if version == 1 {
 		return loadIndexV1(buffered)
 	}
+	if version == 2 {
+		return loadIndexV2(buffered)
+	}
 	if version != persistedVersion {
 		return nil, ErrUnsupportedVersion
 	}
+	if _, err := file.Seek(8, io.SeekStart); err != nil {
+		return nil, err
+	}
+	bodySize := size - 8 - 4
+	if bodySize < 0 {
+		return nil, ErrCorruptIndex
+	}
+	bodyChecksum := crc32.NewIEEE()
+	buffered = bufio.NewReader(io.TeeReader(io.NewSectionReader(file, 8, bodySize), bodyChecksum))
 
 	var persistedPrecision uint32
 	if err := binary.Read(buffered, binary.BigEndian, &persistedPrecision); err != nil {
@@ -1331,16 +1388,59 @@ func loadIndex(reader io.Reader) (*LocationIndex, error) {
 	idx.byHotSpatialFallback = byHotSpatialFallback
 	idx.hotSpatialCells = hotSpatialCells
 
+	if _, err := file.Seek(size-4, io.SeekStart); err != nil {
+		return nil, err
+	}
+	var expectedChecksum uint32
+	if err := binary.Read(file, binary.BigEndian, &expectedChecksum); err != nil {
+		return nil, err
+	}
+	if bodyChecksum.Sum32() != expectedChecksum {
+		return nil, ErrCorruptIndex
+	}
+	if err := idx.validateLoadedState(); err != nil {
+		return nil, err
+	}
+
 	return idx, nil
 }
 
+func loadIndexV2(reader io.Reader) (*LocationIndex, error) {
+	idx, err := loadIndexV1Body(reader, true)
+	if err != nil {
+		return nil, err
+	}
+	return idx, idx.validateLoadedState()
+}
+
 func loadIndexV1(reader io.Reader) (*LocationIndex, error) {
+	idx, err := loadIndexV1Body(reader, false)
+	if err != nil {
+		return nil, err
+	}
+	return idx, idx.validateLoadedState()
+}
+
+func loadIndexV1Body(reader io.Reader, withOptions bool) (*LocationIndex, error) {
+	options := DefaultIndexOptions()
+	if withOptions {
+		var persistedPrecision uint32
+		if err := binary.Read(reader, binary.BigEndian, &persistedPrecision); err != nil {
+			return nil, err
+		}
+		var persistedHotThreshold uint32
+		if err := binary.Read(reader, binary.BigEndian, &persistedHotThreshold); err != nil {
+			return nil, err
+		}
+		options = IndexOptions{SpatialCellPrecision: uint(persistedPrecision), HotSpatialCellThreshold: int(persistedHotThreshold)}
+	}
+
 	var count uint32
 	if err := binary.Read(reader, binary.BigEndian, &count); err != nil {
 		return nil, err
 	}
 
-	idx := NewLocationIndex()
+	idx := NewLocationIndexWithOptions(options)
 	for i := uint32(0); i < count; i++ {
 		record, err := readRecord(reader)
 		if err != nil {
@@ -1352,6 +1452,42 @@ func loadIndexV1(reader io.Reader) (*LocationIndex, error) {
 	}
 
 	return idx, nil
+}
+
+func (idx *LocationIndex) validateLoadedState() error {
+	for recordID, docID := range idx.docIDsByRecord {
+		if _, ok := idx.Records[recordID]; !ok {
+			return ErrCorruptIndex
+		}
+		if mappedRecordID, ok := idx.recordsByDocID[docID]; !ok || mappedRecordID != recordID {
+			return ErrCorruptIndex
+		}
+		if _, ok := idx.decodedRecords[docID]; !ok {
+			return ErrCorruptIndex
+		}
+	}
+	for docID, recordID := range idx.recordsByDocID {
+		if mappedDocID, ok := idx.docIDsByRecord[recordID]; !ok || mappedDocID != docID {
+			return ErrCorruptIndex
+		}
+	}
+	for _, sets := range []map[string]Set[docID]{idx.ByPayload, idx.ByPayloadPrefix, idx.bySpatialPrefix, idx.bySpatialCell, idx.byRefinedSpatialCell, idx.byHotSpatialFallback} {
+		for _, set := range sets {
+			for docID := range set {
+				if _, ok := idx.recordsByDocID[docID]; !ok {
+					return ErrCorruptIndex
+				}
+			}
+		}
+	}
+	for _, set := range idx.ByLabel {
+		for docID := range set {
+			if _, ok := idx.recordsByDocID[docID]; !ok {
+				return ErrCorruptIndex
+			}
+		}
+	}
+	return nil
 }
 
 func writeDecodedLocation(writer io.Writer, decoded locationid.DecodedLocation) error {

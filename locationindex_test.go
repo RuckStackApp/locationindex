@@ -1,6 +1,7 @@
 package locationindex
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -374,6 +375,32 @@ func TestSaveAndLoad(t *testing.T) {
 	}
 	if string(data[:4]) != string(persistedMagic[:]) {
 		t.Fatalf("persisted magic = %q, want %q", string(data[:4]), string(persistedMagic[:]))
+	}
+}
+
+func TestLoadCorruptIndex(t *testing.T) {
+	idx := NewLocationIndex()
+	if err := idx.Insert(mustRecord(t, "one", 37.7749, -122.4194, 12, []Label{"a"})); err != nil {
+		t.Fatalf("Insert() error = %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "corrupt.lidx")
+	if err := idx.Save(path); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	data[len(data)-1] ^= 0xFF
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	_, err = Load(path)
+	if !errors.Is(err, ErrCorruptIndex) {
+		t.Fatalf("Load() error = %v, want %v", err, ErrCorruptIndex)
 	}
 }
 
