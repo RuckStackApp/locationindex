@@ -226,6 +226,68 @@ func TestSearchBoundingBox(t *testing.T) {
 	}
 }
 
+func TestHotSpatialCellPromotion(t *testing.T) {
+	original := HotSpatialCellThreshold()
+	defer func() {
+		if err := SetHotSpatialCellThreshold(original); err != nil {
+			t.Fatalf("restore threshold error = %v", err)
+		}
+	}()
+
+	if err := SetHotSpatialCellThreshold(1); err != nil {
+		t.Fatalf("SetHotSpatialCellThreshold() error = %v", err)
+	}
+
+	idx := NewLocationIndex()
+	records := []IndexedRecord{
+		mustRecord(t, "one", 37.7749, -122.4194, 14, []Label{"a"}),
+		mustRecord(t, "two", 37.7750, -122.4195, 14, []Label{"a"}),
+	}
+
+	for _, record := range records {
+		if err := idx.Insert(record); err != nil {
+			t.Fatalf("Insert() error = %v", err)
+		}
+	}
+
+	if len(idx.hotSpatialCells) == 0 {
+		t.Fatalf("expected at least one hot spatial cell")
+	}
+	if len(idx.byRefinedSpatialCell) == 0 {
+		t.Fatalf("expected refined spatial postings to be populated")
+	}
+}
+
+func TestHotSpatialCellFallbackForCoarseRecords(t *testing.T) {
+	original := HotSpatialCellThreshold()
+	defer func() {
+		if err := SetHotSpatialCellThreshold(original); err != nil {
+			t.Fatalf("restore threshold error = %v", err)
+		}
+	}()
+
+	if err := SetHotSpatialCellThreshold(1); err != nil {
+		t.Fatalf("SetHotSpatialCellThreshold() error = %v", err)
+	}
+
+	idx := NewLocationIndex()
+	for _, record := range []IndexedRecord{
+		mustRecord(t, "one", 37.7749, -122.4194, 12, []Label{"a"}),
+		mustRecord(t, "two", 37.7750, -122.4195, 12, []Label{"a"}),
+	} {
+		if err := idx.Insert(record); err != nil {
+			t.Fatalf("Insert() error = %v", err)
+		}
+	}
+
+	if len(idx.hotSpatialCells) == 0 {
+		t.Fatalf("expected at least one hot spatial cell")
+	}
+	if len(idx.byHotSpatialFallback) == 0 {
+		t.Fatalf("expected hot spatial fallback postings to be populated")
+	}
+}
+
 func TestCoverSpatialPrefixesForBox(t *testing.T) {
 	box := BoundingBox{
 		MinLat: 37.70,
@@ -378,6 +440,25 @@ func TestSetSpatialCellPrecision(t *testing.T) {
 	}
 	if err := SetSpatialCellPrecision(0); err == nil {
 		t.Fatalf("expected error for zero precision")
+	}
+}
+
+func TestSetHotSpatialCellThreshold(t *testing.T) {
+	original := HotSpatialCellThreshold()
+	defer func() {
+		if err := SetHotSpatialCellThreshold(original); err != nil {
+			t.Fatalf("restore threshold error = %v", err)
+		}
+	}()
+
+	if err := SetHotSpatialCellThreshold(2); err != nil {
+		t.Fatalf("SetHotSpatialCellThreshold() error = %v", err)
+	}
+	if HotSpatialCellThreshold() != 2 {
+		t.Fatalf("HotSpatialCellThreshold() = %d, want 2", HotSpatialCellThreshold())
+	}
+	if err := SetHotSpatialCellThreshold(0); err == nil {
+		t.Fatalf("expected error for zero threshold")
 	}
 }
 

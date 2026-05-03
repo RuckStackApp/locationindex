@@ -16,9 +16,12 @@ import (
 
 const persistedVersion = 1
 const defaultSpatialCellPrecision = 14
+const defaultHotSpatialCellThreshold = 4096
+const refinedSpatialCellExtraPrecision = 2
 
 var persistedMagic = [4]byte{'L', 'I', 'D', 'X'}
 var spatialCellPrecision = uint(defaultSpatialCellPrecision)
+var hotSpatialCellThreshold = defaultHotSpatialCellThreshold
 
 var (
 	ErrMissingID          = errors.New("missing record id")
@@ -143,29 +146,35 @@ func (s Set[T]) Intersection(other Set[T]) Set[T] {
 }
 
 type LocationIndex struct {
-	Records         map[RecordID]IndexedRecord
-	ByPayload       map[string]Set[docID]
-	ByPayloadPrefix map[string]Set[docID]
-	ByLabel         map[Label]Set[docID]
-	bySpatialPrefix map[string]Set[docID]
-	bySpatialCell   map[string]Set[docID]
-	decodedRecords  map[docID]locationid.DecodedLocation
-	docIDsByRecord  map[RecordID]docID
-	recordsByDocID  map[docID]RecordID
-	nextDocID       docID
+	Records              map[RecordID]IndexedRecord
+	ByPayload            map[string]Set[docID]
+	ByPayloadPrefix      map[string]Set[docID]
+	ByLabel              map[Label]Set[docID]
+	bySpatialPrefix      map[string]Set[docID]
+	bySpatialCell        map[string]Set[docID]
+	byRefinedSpatialCell map[string]Set[docID]
+	byHotSpatialFallback map[string]Set[docID]
+	hotSpatialCells      map[string]struct{}
+	decodedRecords       map[docID]locationid.DecodedLocation
+	docIDsByRecord       map[RecordID]docID
+	recordsByDocID       map[docID]RecordID
+	nextDocID            docID
 }
 
 func NewLocationIndex() *LocationIndex {
 	return &LocationIndex{
-		Records:         map[RecordID]IndexedRecord{},
-		ByPayload:       map[string]Set[docID]{},
-		ByPayloadPrefix: map[string]Set[docID]{},
-		ByLabel:         map[Label]Set[docID]{},
-		bySpatialPrefix: map[string]Set[docID]{},
-		bySpatialCell:   map[string]Set[docID]{},
-		decodedRecords:  map[docID]locationid.DecodedLocation{},
-		docIDsByRecord:  map[RecordID]docID{},
-		recordsByDocID:  map[docID]RecordID{},
+		Records:              map[RecordID]IndexedRecord{},
+		ByPayload:            map[string]Set[docID]{},
+		ByPayloadPrefix:      map[string]Set[docID]{},
+		ByLabel:              map[Label]Set[docID]{},
+		bySpatialPrefix:      map[string]Set[docID]{},
+		bySpatialCell:        map[string]Set[docID]{},
+		byRefinedSpatialCell: map[string]Set[docID]{},
+		byHotSpatialFallback: map[string]Set[docID]{},
+		hotSpatialCells:      map[string]struct{}{},
+		decodedRecords:       map[docID]locationid.DecodedLocation{},
+		docIDsByRecord:       map[RecordID]docID{},
+		recordsByDocID:       map[docID]RecordID{},
 	}
 }
 
@@ -180,6 +189,19 @@ func SetSpatialCellPrecision(precision uint) error {
 
 func SpatialCellPrecision() uint {
 	return spatialCellPrecision
+}
+
+func SetHotSpatialCellThreshold(threshold int) error {
+	if threshold <= 0 {
+		return fmt.Errorf("hot spatial cell threshold must be positive")
+	}
+
+	hotSpatialCellThreshold = threshold
+	return nil
+}
+
+func HotSpatialCellThreshold() int {
+	return hotSpatialCellThreshold
 }
 
 func Load(path string) (*LocationIndex, error) {
@@ -245,8 +267,16 @@ func (idx *LocationIndex) Insert(record IndexedRecord) error {
 	for _, prefix := range spatialPrefixes(decoded) {
 		idx.ensureSpatialPrefixSet(prefix).Add(docID)
 	}
-	for _, cell := range spatialCellsForBounds(decoded.Bounds) {
-		idx.ensureSpatialCellSet(cell).Add(docID)
+	for _, cell := range spatialCellsForBoundsAtPrecision(decoded.Bounds, spatialCellPrecision) {
+		set := idx.ensureSpatialCellSet(cell)
+		set.Add(docID)
+		if idx.isHotSpatialCell(cell) {
+			idx.indexHotSpatialRecord(cell, docID, decoded)
+			continue
+		}
+		if len(set) > hotSpatialCellThreshold {
+			idx.promoteHotSpatialCell(cell)
+		}
 	}
 
 	for _, prefix := range prefixes(record.Payload) {
@@ -281,8 +311,11 @@ func (idx *LocationIndex) Remove(id RecordID) error {
 		for _, prefix := range spatialPrefixes(decoded) {
 			idx.removeFromStringKeyedSet(idx.bySpatialPrefix, prefix, docID)
 		}
-		for _, cell := range spatialCellsForBounds(decoded.Bounds) {
+		for _, cell := range spatialCellsForBoundsAtPrecision(decoded.Bounds, spatialCellPrecision) {
 			idx.removeFromStringKeyedSet(idx.bySpatialCell, cell, docID)
+			if idx.isHotSpatialCell(cell) {
+				idx.removeHotSpatialRecord(cell, docID, decoded)
+			}
 		}
 	}
 
@@ -338,8 +371,7 @@ func (idx *LocationIndex) SearchBoundingBox(box BoundingBox, precision uint, opt
 
 func (idx *LocationIndex) SearchBoundingBoxDetailed(box BoundingBox, precision uint, opts QueryOptions) RecordSearchResponse {
 	_ = precision
-	cells := spatialCellsForBounds(boundsFromBoundingBox(box))
-	candidateIDs := idx.candidateIDsForSpatialCells(cells)
+	candidateIDs, cellCount := idx.candidateIDsForQueryBounds(boundsFromBoundingBox(box))
 	candidateIDs = idx.filterByLabels(candidateIDs, opts.Labels)
 
 	results := make([]IndexedRecord, 0, len(candidateIDs))
@@ -365,7 +397,7 @@ func (idx *LocationIndex) SearchBoundingBoxDetailed(box BoundingBox, precision u
 		Stats: SearchStats{
 			CandidateCount: len(candidateIDs),
 			ResultCount:    len(results),
-			PrefixCount:    len(cells),
+			PrefixCount:    cellCount,
 		},
 		Records: results,
 	}
@@ -377,8 +409,7 @@ func (idx *LocationIndex) SearchRadius(q RadiusQuery, opts QueryOptions) []Resul
 
 func (idx *LocationIndex) SearchRadiusDetailed(q RadiusQuery, opts QueryOptions) ResultSearchResponse {
 	_ = q.Precision
-	cells := spatialCellsForBounds(boundsFromBoundingBox(boundingBoxForRadius(q.Lat, q.Lon, q.RadiusMeters)))
-	candidateIDs := idx.candidateIDsForSpatialCells(cells)
+	candidateIDs, cellCount := idx.candidateIDsForQueryBounds(boundsFromBoundingBox(boundingBoxForRadius(q.Lat, q.Lon, q.RadiusMeters)))
 	candidateIDs = idx.filterByLabels(candidateIDs, opts.Labels)
 
 	results := make([]Result, 0, len(candidateIDs))
@@ -412,7 +443,7 @@ func (idx *LocationIndex) SearchRadiusDetailed(q RadiusQuery, opts QueryOptions)
 		Stats: SearchStats{
 			CandidateCount: len(candidateIDs),
 			ResultCount:    len(results),
-			PrefixCount:    len(cells),
+			PrefixCount:    cellCount,
 		},
 		Results: results,
 	}
@@ -519,6 +550,20 @@ func (idx *LocationIndex) ensureSpatialCellSet(cell string) Set[docID] {
 	return idx.bySpatialCell[cell]
 }
 
+func (idx *LocationIndex) ensureRefinedSpatialCellSet(cell string) Set[docID] {
+	if idx.byRefinedSpatialCell[cell] == nil {
+		idx.byRefinedSpatialCell[cell] = NewSet[docID]()
+	}
+	return idx.byRefinedSpatialCell[cell]
+}
+
+func (idx *LocationIndex) ensureHotSpatialFallbackSet(cell string) Set[docID] {
+	if idx.byHotSpatialFallback[cell] == nil {
+		idx.byHotSpatialFallback[cell] = NewSet[docID]()
+	}
+	return idx.byHotSpatialFallback[cell]
+}
+
 func (idx *LocationIndex) removeFromStringKeyedSet(sets map[string]Set[docID], key string, id docID) {
 	set := sets[key]
 	if set == nil {
@@ -621,6 +666,56 @@ func (idx *LocationIndex) candidateIDsForSpatialCells(cells []string) Set[docID]
 	return ids
 }
 
+func (idx *LocationIndex) candidateIDsForQueryBounds(bounds locationid.Bounds) (Set[docID], int) {
+	baseCells := spatialCellsForBoundsAtPrecision(bounds, spatialCellPrecision)
+	usedCells := 0
+	needsRefined := false
+	for _, cell := range baseCells {
+		if idx.isHotSpatialCell(cell) {
+			needsRefined = true
+			break
+		}
+	}
+
+	ids := NewSet[docID]()
+	if !needsRefined {
+		for _, cell := range baseCells {
+			usedCells++
+			ids.AddAll(idx.bySpatialCell[cell])
+		}
+		return ids, usedCells
+	}
+
+	refinedPrecision := idx.refinedSpatialCellPrecision()
+	refinedCells := spatialCellsForBoundsAtPrecision(bounds, refinedPrecision)
+	for _, cell := range refinedCells {
+		parent := parentSpatialCell(cell, spatialCellPrecision)
+		if !idx.isHotSpatialCell(parent) {
+			continue
+		}
+		usedCells++
+		ids.AddAll(idx.byRefinedSpatialCell[cell])
+	}
+
+	for _, cell := range baseCells {
+		if !idx.isHotSpatialCell(cell) {
+			continue
+		}
+		usedCells++
+		ids.AddAll(idx.byHotSpatialFallback[cell])
+	}
+
+	for _, cell := range baseCells {
+		if idx.isHotSpatialCell(cell) {
+			continue
+		}
+		usedCells++
+		ids.AddAll(idx.bySpatialCell[cell])
+	}
+
+	return ids, usedCells
+}
+
 func limitRecords(records []IndexedRecord, limit int) []IndexedRecord {
 	if limit > 0 && len(records) > limit {
 		return records[:limit]
@@ -688,6 +783,74 @@ func (idx *LocationIndex) allocateDocID(recordID RecordID) docID {
 	return docID
 }
 
+func (idx *LocationIndex) refinedSpatialCellPrecision() uint {
+	precision := spatialCellPrecision + refinedSpatialCellExtraPrecision
+	if precision > 20 {
+		return 20
+	}
+	return precision
+}
+
+func (idx *LocationIndex) isHotSpatialCell(cell string) bool {
+	_, ok := idx.hotSpatialCells[cell]
+	return ok
+}
+
+func (idx *LocationIndex) promoteHotSpatialCell(cell string) {
+	if idx.isHotSpatialCell(cell) {
+		return
+	}
+
+	idx.hotSpatialCells[cell] = struct{}{}
+	for docID := range idx.bySpatialCell[cell] {
+		decoded, ok := idx.decodedRecords[docID]
+		if !ok {
+			continue
+		}
+		idx.indexHotSpatialRecord(cell, docID, decoded)
+	}
+}
+
+func (idx *LocationIndex) indexHotSpatialRecord(baseCell string, id docID, decoded locationid.DecodedLocation) {
+	if !idx.canRefineSpatialRecord(decoded) {
+		idx.ensureHotSpatialFallbackSet(baseCell).Add(id)
+		return
+	}
+
+	idx.indexRefinedSpatialCells(baseCell, id, decoded.Bounds)
+}
+
+func (idx *LocationIndex) removeHotSpatialRecord(baseCell string, id docID, decoded locationid.DecodedLocation) {
+	if !idx.canRefineSpatialRecord(decoded) {
+		idx.removeFromStringKeyedSet(idx.byHotSpatialFallback, baseCell, id)
+		return
+	}
+
+	idx.removeRefinedSpatialCells(baseCell, id, decoded.Bounds)
+}
+
+func (idx *LocationIndex) canRefineSpatialRecord(decoded locationid.DecodedLocation) bool {
+	return decoded.Precision+refinedSpatialCellExtraPrecision >= idx.refinedSpatialCellPrecision()
+}
+
+func (idx *LocationIndex) indexRefinedSpatialCells(baseCell string, id docID, bounds locationid.Bounds) {
+	for _, cell := range spatialCellsForBoundsAtPrecision(bounds, idx.refinedSpatialCellPrecision()) {
+		if parentSpatialCell(cell, spatialCellPrecision) != baseCell {
+			continue
+		}
+		idx.ensureRefinedSpatialCellSet(cell).Add(id)
+	}
+}
+
+func (idx *LocationIndex) removeRefinedSpatialCells(baseCell string, id docID, bounds locationid.Bounds) {
+	for _, cell := range spatialCellsForBoundsAtPrecision(bounds, idx.refinedSpatialCellPrecision()) {
+		if parentSpatialCell(cell, spatialCellPrecision) != baseCell {
+			continue
+		}
+		idx.removeFromStringKeyedSet(idx.byRefinedSpatialCell, cell, id)
+	}
+}
+
 func intersects(box BoundingBox, bounds locationid.Bounds) bool {
 	if box.MaxLat < bounds.MinLat || box.MinLat > bounds.MaxLat {
 		return false
@@ -740,7 +903,19 @@ func coverSpatialPrefixesForBox(box BoundingBox, precision uint, stopOnContainme
 }
 
 func spatialCellsForBounds(bounds locationid.Bounds) []string {
-	return coverSpatialPrefixesForBox(boundingBoxFromBounds(bounds), spatialCellPrecision, false)
+	return spatialCellsForBoundsAtPrecision(bounds, spatialCellPrecision)
+}
+
+func spatialCellsForBoundsAtPrecision(bounds locationid.Bounds, precision uint) []string {
+	return coverSpatialPrefixesForBox(boundingBoxFromBounds(bounds), precision, false)
+}
+
+func parentSpatialCell(cell string, precision uint) string {
+	length := int(precision * 2)
+	if length <= 0 || len(cell) <= length {
+		return cell
+	}
+	return cell[:length]
 }
 
 func Haversine(lat1, lon1, lat2, lon2 float64) float64 {
