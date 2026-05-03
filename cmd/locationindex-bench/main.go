@@ -16,7 +16,7 @@ import (
 	"time"
 
 	locationid "github.com/ruckstackapp/locationid/go"
-	"locationindex"
+	"github.com/ruckstackapp/locationindex"
 )
 
 func main() {

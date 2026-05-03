@@ -9,7 +9,7 @@ import (
 	"os"
 	"strings"
 
-	"locationindex"
+	"github.com/ruckstackapp/locationindex"
 )
 
 func main() {

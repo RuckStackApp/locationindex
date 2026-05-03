@@ -1,4 +1,4 @@
-module locationindex
+module github.com/ruckstackapp/locationindex
 
 go 1.22
 
