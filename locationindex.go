@@ -323,10 +323,19 @@ func Load(path string) (*LocationIndex, error) {
 	return loadIndex(file, info.Size())
 }
 
+// Open loads a persisted index snapshot from disk.
+//
+// Open is an alias for Load and exists to read more naturally in service
+// lifecycle code.
 func Open(path string) (*LocationIndex, error) {
 	return Load(path)
 }
 
+// RebuildFromSnapshot constructs a fresh mutable index from a point-in-time
+// snapshot.
+//
+// This is the preferred rebuild primitive for services that want an explicit
+// snapshot-to-index workflow instead of mutating an existing live instance.
 func RebuildFromSnapshot(snapshot Snapshot) (*LocationIndex, error) {
 	idx := NewLocationIndexWithOptions(snapshot.Options)
 	if err := idx.ValidateOptions(); err != nil {
@@ -353,6 +362,7 @@ func prefixes(payload string) []string {
 	return out
 }
 
+// Insert adds a record and eagerly updates all derived postings and caches.
 func (idx *LocationIndex) Insert(record IndexedRecord) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -410,6 +420,7 @@ func (idx *LocationIndex) insertLocked(record IndexedRecord) error {
 	return nil
 }
 
+// Remove deletes a record and eagerly updates all derived postings and caches.
 func (idx *LocationIndex) Remove(id RecordID) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -456,6 +467,11 @@ func (idx *LocationIndex) removeLocked(id RecordID) error {
 	return nil
 }
 
+// Update replaces an existing record by removing the old state and inserting the
+// new state within the same mutable index instance.
+//
+// Services that need staged or copy-on-write style updates should prefer Clone
+// or Snapshot plus RebuildFromSnapshot.
 func (idx *LocationIndex) Update(record IndexedRecord) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -629,6 +645,10 @@ func (idx *LocationIndex) SearchNearestDetailed(lat, lon float64, limit int, opt
 	}
 }
 
+// Save writes the current in-memory index as an atomic persisted snapshot.
+//
+// The persistence model is snapshot-based rather than incremental: each save
+// writes a complete durable representation of the current index state.
 func (idx *LocationIndex) Save(path string) error {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
@@ -645,6 +665,11 @@ func (idx *LocationIndex) Save(path string) error {
 	})
 }
 
+// Snapshot exports a point-in-time copy of the public index contents and index
+// options.
+//
+// The returned snapshot is suitable for rebuild workflows and service-managed
+// staged mutation flows.
 func (idx *LocationIndex) Snapshot() Snapshot {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
@@ -660,6 +685,10 @@ func (idx *LocationIndex) Snapshot() Snapshot {
 	}
 }
 
+// Clone rebuilds a logically equivalent index from the current snapshot.
+//
+// Clone is useful when a caller wants to stage mutations on a separate index
+// instance without sharing internal mutable state with the original.
 func (idx *LocationIndex) Clone() (*LocationIndex, error) {
 	return RebuildFromSnapshot(idx.Snapshot())
 }
