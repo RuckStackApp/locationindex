@@ -73,6 +73,28 @@ type ResultSearchResponse struct {
 	Results []Result    `json:"results"`
 }
 
+type IndexStats struct {
+	Options                        IndexOptions `json:"options"`
+	RecordCount                    int          `json:"record_count"`
+	DocIDCount                     int          `json:"doc_id_count"`
+	PayloadKeyCount                int          `json:"payload_key_count"`
+	PayloadPostingCount            int          `json:"payload_posting_count"`
+	PayloadPrefixKeyCount          int          `json:"payload_prefix_key_count"`
+	PayloadPrefixPostingCount      int          `json:"payload_prefix_posting_count"`
+	LabelKeyCount                  int          `json:"label_key_count"`
+	LabelPostingCount              int          `json:"label_posting_count"`
+	SpatialPrefixKeyCount          int          `json:"spatial_prefix_key_count"`
+	SpatialPrefixPostingCount      int          `json:"spatial_prefix_posting_count"`
+	SpatialCellKeyCount            int          `json:"spatial_cell_key_count"`
+	SpatialCellPostingCount        int          `json:"spatial_cell_posting_count"`
+	RefinedSpatialKeyCount         int          `json:"refined_spatial_key_count"`
+	RefinedSpatialPostingCount     int          `json:"refined_spatial_posting_count"`
+	HotSpatialFallbackKeyCount     int          `json:"hot_spatial_fallback_key_count"`
+	HotSpatialFallbackPostingCount int          `json:"hot_spatial_fallback_posting_count"`
+	HotSpatialCellCount            int          `json:"hot_spatial_cell_count"`
+	DecodedRecordCount             int          `json:"decoded_record_count"`
+}
+
 type QueryOptions struct {
 	Labels              []Label
 	Limit               int
@@ -192,6 +214,30 @@ func NewLocationIndexWithOptions(options IndexOptions) *LocationIndex {
 
 func (idx *LocationIndex) ValidateOptions() error {
 	return validateIndexOptions(idx.Options)
+}
+
+func (idx *LocationIndex) Stats() IndexStats {
+	return IndexStats{
+		Options:                        idx.Options,
+		RecordCount:                    len(idx.Records),
+		DocIDCount:                     len(idx.recordsByDocID),
+		PayloadKeyCount:                len(idx.ByPayload),
+		PayloadPostingCount:            countDocIDSetMapEntries(idx.ByPayload),
+		PayloadPrefixKeyCount:          len(idx.ByPayloadPrefix),
+		PayloadPrefixPostingCount:      countDocIDSetMapEntries(idx.ByPayloadPrefix),
+		LabelKeyCount:                  len(idx.ByLabel),
+		LabelPostingCount:              countLabelDocIDSetMapEntries(idx.ByLabel),
+		SpatialPrefixKeyCount:          len(idx.bySpatialPrefix),
+		SpatialPrefixPostingCount:      countDocIDSetMapEntries(idx.bySpatialPrefix),
+		SpatialCellKeyCount:            len(idx.bySpatialCell),
+		SpatialCellPostingCount:        countDocIDSetMapEntries(idx.bySpatialCell),
+		RefinedSpatialKeyCount:         len(idx.byRefinedSpatialCell),
+		RefinedSpatialPostingCount:     countDocIDSetMapEntries(idx.byRefinedSpatialCell),
+		HotSpatialFallbackKeyCount:     len(idx.byHotSpatialFallback),
+		HotSpatialFallbackPostingCount: countDocIDSetMapEntries(idx.byHotSpatialFallback),
+		HotSpatialCellCount:            len(idx.hotSpatialCells),
+		DecodedRecordCount:             len(idx.decodedRecords),
+	}
 }
 
 func DefaultIndexOptions() IndexOptions {
@@ -1790,4 +1836,20 @@ func sortedStringKeys[T any](values map[string]T) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+func countDocIDSetMapEntries(values map[string]Set[docID]) int {
+	total := 0
+	for _, set := range values {
+		total += len(set)
+	}
+	return total
+}
+
+func countLabelDocIDSetMapEntries(values map[Label]Set[docID]) int {
+	total := 0
+	for _, set := range values {
+		total += len(set)
+	}
+	return total
 }

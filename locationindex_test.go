@@ -404,6 +404,54 @@ func TestLoadCorruptIndex(t *testing.T) {
 	}
 }
 
+func TestStats(t *testing.T) {
+	idx := NewLocationIndexWithOptions(IndexOptions{SpatialCellPrecision: 14, HotSpatialCellThreshold: 2})
+	for _, record := range []IndexedRecord{
+		mustRecord(t, "one", 37.7749, -122.4194, 12, []Label{"city", "west"}),
+		mustRecord(t, "two", 34.0522, -118.2437, 12, []Label{"city", "south"}),
+	} {
+		if err := idx.Insert(record); err != nil {
+			t.Fatalf("Insert() error = %v", err)
+		}
+	}
+
+	stats := idx.Stats()
+	if stats.RecordCount != 2 {
+		t.Fatalf("RecordCount = %d, want 2", stats.RecordCount)
+	}
+	if stats.DocIDCount != 2 {
+		t.Fatalf("DocIDCount = %d, want 2", stats.DocIDCount)
+	}
+	if stats.DecodedRecordCount != 2 {
+		t.Fatalf("DecodedRecordCount = %d, want 2", stats.DecodedRecordCount)
+	}
+	if stats.Options.SpatialCellPrecision != 14 {
+		t.Fatalf("SpatialCellPrecision = %d, want 14", stats.Options.SpatialCellPrecision)
+	}
+	if stats.Options.HotSpatialCellThreshold != 2 {
+		t.Fatalf("HotSpatialCellThreshold = %d, want 2", stats.Options.HotSpatialCellThreshold)
+	}
+	if stats.PayloadPostingCount != 2 {
+		t.Fatalf("PayloadPostingCount = %d, want 2", stats.PayloadPostingCount)
+	}
+	if stats.LabelPostingCount != 4 {
+		t.Fatalf("LabelPostingCount = %d, want 4", stats.LabelPostingCount)
+	}
+
+	path := filepath.Join(t.TempDir(), "stats.lidx")
+	if err := idx.Save(path); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	loadedStats := loaded.Stats()
+	if loadedStats.RecordCount != stats.RecordCount || loadedStats.DocIDCount != stats.DocIDCount {
+		t.Fatalf("loaded stats mismatch: %#v vs %#v", loadedStats, stats)
+	}
+}
+
 func TestSpatialBitsAndBounds(t *testing.T) {
 	record := mustRecord(t, "sf", 37.7749, -122.4194, 12, nil)
 	decoded, err := locationid.Decode(locationid.New(record.Code))
