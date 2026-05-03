@@ -2,8 +2,10 @@ package locationindex
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	locationid "github.com/ruckstackapp/locationid/go"
@@ -493,6 +495,39 @@ func TestValidateIndexOptions(t *testing.T) {
 	if err := bad.ValidateOptions(); err == nil {
 		t.Fatalf("expected validation error")
 	}
+}
+
+func TestConcurrentReadWrite(t *testing.T) {
+	idx := NewLocationIndex()
+	for i := 0; i < 10; i++ {
+		record := mustRecord(t, fmt.Sprintf("rec_%08d", i), 37.7749+float64(i)*0.001, -122.4194, 12, []Label{"city"})
+		if err := idx.Insert(record); err != nil {
+			t.Fatalf("Insert() error = %v", err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				_ = idx.Stats()
+				_, _ = idx.GetByID("rec_00000001")
+				_ = idx.SearchByPrefix("4", QueryOptions{Limit: 5})
+			}
+		}()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		record := mustRecord(t, "writer", 34.0522, -118.2437, 12, []Label{"city"})
+		_ = idx.Update(record)
+		_ = idx.Remove("writer")
+	}()
+
+	wg.Wait()
 }
 
 func mustRecord(t *testing.T, id string, lat, lon float64, precision uint, labels []Label) IndexedRecord {

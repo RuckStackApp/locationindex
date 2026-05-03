@@ -11,6 +11,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 
 	locationid "github.com/ruckstackapp/locationid/go"
 )
@@ -173,6 +174,7 @@ func (s Set[T]) Intersection(other Set[T]) Set[T] {
 }
 
 type LocationIndex struct {
+	mu                   sync.RWMutex
 	Options              IndexOptions
 	Records              map[RecordID]IndexedRecord
 	ByPayload            map[string]Set[docID]
@@ -213,10 +215,14 @@ func NewLocationIndexWithOptions(options IndexOptions) *LocationIndex {
 }
 
 func (idx *LocationIndex) ValidateOptions() error {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
 	return validateIndexOptions(idx.Options)
 }
 
 func (idx *LocationIndex) Stats() IndexStats {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
 	return IndexStats{
 		Options:                        idx.Options,
 		RecordCount:                    len(idx.Records),
@@ -319,6 +325,12 @@ func prefixes(payload string) []string {
 }
 
 func (idx *LocationIndex) Insert(record IndexedRecord) error {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	return idx.insertLocked(record)
+}
+
+func (idx *LocationIndex) insertLocked(record IndexedRecord) error {
 	if record.ID == "" {
 		return ErrMissingID
 	}
@@ -370,6 +382,12 @@ func (idx *LocationIndex) Insert(record IndexedRecord) error {
 }
 
 func (idx *LocationIndex) Remove(id RecordID) error {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	return idx.removeLocked(id)
+}
+
+func (idx *LocationIndex) removeLocked(id RecordID) error {
 	record, exists := idx.Records[id]
 	if !exists {
 		return ErrNotFound
@@ -410,16 +428,24 @@ func (idx *LocationIndex) Remove(id RecordID) error {
 }
 
 func (idx *LocationIndex) Update(record IndexedRecord) error {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	return idx.updateLocked(record)
+}
+
+func (idx *LocationIndex) updateLocked(record IndexedRecord) error {
 	if _, exists := idx.Records[record.ID]; exists {
-		if err := idx.Remove(record.ID); err != nil {
+		if err := idx.removeLocked(record.ID); err != nil {
 			return err
 		}
 	}
 
-	return idx.Insert(record)
+	return idx.insertLocked(record)
 }
 
 func (idx *LocationIndex) GetByID(id RecordID) (IndexedRecord, bool) {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
 	record, ok := idx.Records[id]
 	return record, ok
 }
@@ -429,6 +455,8 @@ func (idx *LocationIndex) SearchByPrefix(prefix string, opts QueryOptions) []Ind
 }
 
 func (idx *LocationIndex) SearchByPrefixDetailed(prefix string, opts QueryOptions) PrefixSearchResponse {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
 	prefix = strings.ToUpper(prefix)
 	ids := idx.ByPayloadPrefix[prefix]
 	records, candidateCount, candidateCountExact, hasMore := idx.prefixRecordsForIDs(ids, opts)
@@ -449,6 +477,8 @@ func (idx *LocationIndex) SearchBoundingBox(box BoundingBox, precision uint, opt
 }
 
 func (idx *LocationIndex) SearchBoundingBoxDetailed(box BoundingBox, precision uint, opts QueryOptions) RecordSearchResponse {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
 	_ = precision
 	candidateIDs, cellCount := idx.candidateIDsForQueryBounds(boundsFromBoundingBox(box))
 	candidateIDs = idx.filterByLabels(candidateIDs, opts.Labels)
@@ -487,6 +517,12 @@ func (idx *LocationIndex) SearchRadius(q RadiusQuery, opts QueryOptions) []Resul
 }
 
 func (idx *LocationIndex) SearchRadiusDetailed(q RadiusQuery, opts QueryOptions) ResultSearchResponse {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return idx.searchRadiusDetailedLocked(q, opts)
+}
+
+func (idx *LocationIndex) searchRadiusDetailedLocked(q RadiusQuery, opts QueryOptions) ResultSearchResponse {
 	_ = q.Precision
 	candidateIDs, cellCount := idx.candidateIDsForQueryBounds(boundsFromBoundingBox(boundingBoxForRadius(q.Lat, q.Lon, q.RadiusMeters)))
 	candidateIDs = idx.filterByLabels(candidateIDs, opts.Labels)
@@ -533,6 +569,8 @@ func (idx *LocationIndex) SearchNearest(lat, lon float64, limit int, opts QueryO
 }
 
 func (idx *LocationIndex) SearchNearestDetailed(lat, lon float64, limit int, opts QueryOptions) ResultSearchResponse {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
 	if limit <= 0 {
 		return ResultSearchResponse{}
 	}
@@ -541,7 +579,7 @@ func (idx *LocationIndex) SearchNearestDetailed(lat, lon float64, limit int, opt
 	expansions := 0
 	for {
 		expansions++
-		response := idx.SearchRadiusDetailed(RadiusQuery{
+		response := idx.searchRadiusDetailedLocked(RadiusQuery{
 			Lat:          lat,
 			Lon:          lon,
 			RadiusMeters: radius,
@@ -563,6 +601,8 @@ func (idx *LocationIndex) SearchNearestDetailed(lat, lon float64, limit int, opt
 }
 
 func (idx *LocationIndex) Save(path string) error {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
 	records := make([]IndexedRecord, 0, len(idx.Records))
 	for _, id := range sortedRecordIDsFromDocIDs(idx.recordsByDocID) {
 		records = append(records, idx.Records[id])
