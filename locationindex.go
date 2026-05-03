@@ -132,6 +132,13 @@ func NewSet[T comparable]() Set[T] {
 	return make(Set[T])
 }
 
+func NewSetSize[T comparable](size int) Set[T] {
+	if size <= 0 {
+		return make(Set[T])
+	}
+	return make(Set[T], size)
+}
+
 func (s Set[T]) Add(value T) {
 	s[value] = struct{}{}
 }
@@ -1782,10 +1789,14 @@ func readDocIDSet(reader io.Reader) (Set[docID], error) {
 	if err := binary.Read(reader, binary.BigEndian, &count); err != nil {
 		return nil, err
 	}
-	values := NewSet[docID]()
+	values := NewSetSize[docID](int(count))
 	var previous uint64
+	byteReader, ok := reader.(io.ByteReader)
+	if !ok {
+		byteReader = &readerByteAdapter{reader: reader}
+	}
 	for i := uint32(0); i < count; i++ {
-		delta, err := binary.ReadUvarint(&byteReader{reader: reader})
+		delta, err := binary.ReadUvarint(byteReader)
 		if err != nil {
 			return nil, err
 		}
@@ -1800,7 +1811,7 @@ func readDocIDSetRaw(reader io.Reader) (Set[docID], error) {
 	if err := binary.Read(reader, binary.BigEndian, &count); err != nil {
 		return nil, err
 	}
-	values := NewSet[docID]()
+	values := NewSetSize[docID](int(count))
 	for i := uint32(0); i < count; i++ {
 		var id uint32
 		if err := binary.Read(reader, binary.BigEndian, &id); err != nil {
@@ -1811,11 +1822,11 @@ func readDocIDSetRaw(reader io.Reader) (Set[docID], error) {
 	return values, nil
 }
 
-type byteReader struct {
+type readerByteAdapter struct {
 	reader io.Reader
 }
 
-func (r *byteReader) ReadByte() (byte, error) {
+func (r *readerByteAdapter) ReadByte() (byte, error) {
 	var buffer [1]byte
 	_, err := io.ReadFull(r.reader, buffer[:])
 	return buffer[0], err
