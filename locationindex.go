@@ -16,7 +16,7 @@ import (
 	locationid "github.com/ruckstackapp/locationid/go"
 )
 
-const persistedVersion = 3
+const persistedVersion = 4
 const defaultSpatialCellPrecision = 14
 const defaultHotSpatialCellThreshold = 4096
 const refinedSpatialCellExtraPrecision = 2
@@ -1378,9 +1378,20 @@ func loadIndex(file *os.File, size int64) (*LocationIndex, error) {
 	if version == 2 {
 		return loadIndexV2(buffered)
 	}
+	if version == 3 {
+		return loadIndexV3(file, size)
+	}
 	if version != persistedVersion {
 		return nil, ErrUnsupportedVersion
 	}
+	return loadChecksummedIndex(file, size, true)
+}
+
+func loadIndexV3(file *os.File, size int64) (*LocationIndex, error) {
+	return loadChecksummedIndex(file, size, false)
+}
+
+func loadChecksummedIndex(file *os.File, size int64, compressed bool) (*LocationIndex, error) {
 	if _, err := file.Seek(8, io.SeekStart); err != nil {
 		return nil, err
 	}
@@ -1389,7 +1400,8 @@ func loadIndex(file *os.File, size int64) (*LocationIndex, error) {
 		return nil, ErrCorruptIndex
 	}
 	bodyChecksum := crc32.NewIEEE()
-	buffered = bufio.NewReader(io.TeeReader(io.NewSectionReader(file, 8, bodySize), bodyChecksum))
+	var err error
+	buffered := bufio.NewReader(io.TeeReader(io.NewSectionReader(file, 8, bodySize), bodyChecksum))
 
 	var persistedPrecision uint32
 	if err := binary.Read(buffered, binary.BigEndian, &persistedPrecision); err != nil {
@@ -1432,31 +1444,66 @@ func loadIndex(file *os.File, size int64) (*LocationIndex, error) {
 		}
 	}
 
-	byPayload, err := readDocIDSetMap(buffered)
+	var byPayload map[string]Set[docID]
+	var byLabel map[Label]Set[docID]
+	var byPayloadPrefix map[string]Set[docID]
+	var bySpatialPrefix map[string]Set[docID]
+	var bySpatialCell map[string]Set[docID]
+	var byRefinedSpatialCell map[string]Set[docID]
+	var byHotSpatialFallback map[string]Set[docID]
+	if compressed {
+		byPayload, err = readDocIDSetMap(buffered)
+	} else {
+		byPayload, err = readDocIDSetMapRaw(buffered)
+	}
 	if err != nil {
 		return nil, err
 	}
-	byLabel, err := readLabelDocIDSetMap(buffered)
+	if compressed {
+		byLabel, err = readLabelDocIDSetMap(buffered)
+	} else {
+		byLabel, err = readLabelDocIDSetMapRaw(buffered)
+	}
 	if err != nil {
 		return nil, err
 	}
-	byPayloadPrefix, err := readDocIDSetMap(buffered)
+	if compressed {
+		byPayloadPrefix, err = readDocIDSetMap(buffered)
+	} else {
+		byPayloadPrefix, err = readDocIDSetMapRaw(buffered)
+	}
 	if err != nil {
 		return nil, err
 	}
-	bySpatialPrefix, err := readDocIDSetMap(buffered)
+	if compressed {
+		bySpatialPrefix, err = readDocIDSetMap(buffered)
+	} else {
+		bySpatialPrefix, err = readDocIDSetMapRaw(buffered)
+	}
 	if err != nil {
 		return nil, err
 	}
-	bySpatialCell, err := readDocIDSetMap(buffered)
+	if compressed {
+		bySpatialCell, err = readDocIDSetMap(buffered)
+	} else {
+		bySpatialCell, err = readDocIDSetMapRaw(buffered)
+	}
 	if err != nil {
 		return nil, err
 	}
-	byRefinedSpatialCell, err := readDocIDSetMap(buffered)
+	if compressed {
+		byRefinedSpatialCell, err = readDocIDSetMap(buffered)
+	} else {
+		byRefinedSpatialCell, err = readDocIDSetMapRaw(buffered)
+	}
 	if err != nil {
 		return nil, err
 	}
-	byHotSpatialFallback, err := readDocIDSetMap(buffered)
+	if compressed {
+		byHotSpatialFallback, err = readDocIDSetMap(buffered)
+	} else {
+		byHotSpatialFallback, err = readDocIDSetMapRaw(buffered)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1648,6 +1695,26 @@ func readDocIDSetMap(reader io.Reader) (map[string]Set[docID], error) {
 	return values, nil
 }
 
+func readDocIDSetMapRaw(reader io.Reader) (map[string]Set[docID], error) {
+	var count uint32
+	if err := binary.Read(reader, binary.BigEndian, &count); err != nil {
+		return nil, err
+	}
+	values := make(map[string]Set[docID], count)
+	for i := uint32(0); i < count; i++ {
+		key, err := readString(reader)
+		if err != nil {
+			return nil, err
+		}
+		set, err := readDocIDSetRaw(reader)
+		if err != nil {
+			return nil, err
+		}
+		values[key] = set
+	}
+	return values, nil
+}
+
 func writeLabelDocIDSetMap(writer io.Writer, values map[Label]Set[docID]) error {
 	keys := make([]string, 0, len(values))
 	for key := range values {
@@ -1680,20 +1747,55 @@ func readLabelDocIDSetMap(reader io.Reader) (map[Label]Set[docID], error) {
 	return labels, nil
 }
 
+func readLabelDocIDSetMapRaw(reader io.Reader) (map[Label]Set[docID], error) {
+	values, err := readDocIDSetMapRaw(reader)
+	if err != nil {
+		return nil, err
+	}
+	labels := make(map[Label]Set[docID], len(values))
+	for key, set := range values {
+		labels[Label(key)] = set
+	}
+	return labels, nil
+}
+
 func writeDocIDSet(writer io.Writer, values Set[docID]) error {
 	ordered := sortedDocIDs(values)
 	if err := binary.Write(writer, binary.BigEndian, uint32(len(ordered))); err != nil {
 		return err
 	}
+	var previous uint64
+	var buffer [10]byte
 	for _, id := range ordered {
-		if err := binary.Write(writer, binary.BigEndian, uint32(id)); err != nil {
+		delta := uint64(id) - previous
+		n := binary.PutUvarint(buffer[:], delta)
+		if _, err := writer.Write(buffer[:n]); err != nil {
 			return err
 		}
+		previous = uint64(id)
 	}
 	return nil
 }
 
 func readDocIDSet(reader io.Reader) (Set[docID], error) {
+	var count uint32
+	if err := binary.Read(reader, binary.BigEndian, &count); err != nil {
+		return nil, err
+	}
+	values := NewSet[docID]()
+	var previous uint64
+	for i := uint32(0); i < count; i++ {
+		delta, err := binary.ReadUvarint(&byteReader{reader: reader})
+		if err != nil {
+			return nil, err
+		}
+		previous += delta
+		values.Add(docID(previous))
+	}
+	return values, nil
+}
+
+func readDocIDSetRaw(reader io.Reader) (Set[docID], error) {
 	var count uint32
 	if err := binary.Read(reader, binary.BigEndian, &count); err != nil {
 		return nil, err
@@ -1707,6 +1809,16 @@ func readDocIDSet(reader io.Reader) (Set[docID], error) {
 		values.Add(docID(id))
 	}
 	return values, nil
+}
+
+type byteReader struct {
+	reader io.Reader
+}
+
+func (r *byteReader) ReadByte() (byte, error) {
+	var buffer [1]byte
+	_, err := io.ReadFull(r.reader, buffer[:])
+	return buffer[0], err
 }
 
 func writeStringSet(writer io.Writer, values map[string]struct{}) error {
