@@ -45,18 +45,21 @@ func runCreate(args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	indexPath := fs.String("index", "", "path to index file")
-	cellPrecision := fs.Uint("cell-precision", locationindex.SpatialCellPrecision(), "spatial cell precision")
+	cellPrecision := fs.Uint("cell-precision", locationindex.DefaultIndexOptions().SpatialCellPrecision, "spatial cell precision")
+	hotThreshold := fs.Int("hot-threshold", locationindex.DefaultIndexOptions().HotSpatialCellThreshold, "hot spatial cell threshold")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *indexPath == "" {
 		return errors.New("missing --index")
 	}
-	if err := locationindex.SetSpatialCellPrecision(*cellPrecision); err != nil {
+	idx := locationindex.NewLocationIndexWithOptions(locationindex.IndexOptions{
+		SpatialCellPrecision:    *cellPrecision,
+		HotSpatialCellThreshold: *hotThreshold,
+	})
+	if err := idx.ValidateOptions(); err != nil {
 		return err
 	}
-
-	idx := locationindex.NewLocationIndex()
 	if err := idx.Save(*indexPath); err != nil {
 		return err
 	}
@@ -74,7 +77,8 @@ func runAdd(args []string, stdout io.Writer) error {
 	indexPath := fs.String("index", "", "path to index file")
 	id := fs.String("id", "", "record id")
 	code := fs.String("code", "", "location code")
-	cellPrecision := fs.Uint("cell-precision", locationindex.SpatialCellPrecision(), "spatial cell precision")
+	cellPrecision := fs.Uint("cell-precision", locationindex.DefaultIndexOptions().SpatialCellPrecision, "spatial cell precision for new index")
+	hotThreshold := fs.Int("hot-threshold", locationindex.DefaultIndexOptions().HotSpatialCellThreshold, "hot spatial cell threshold for new index")
 	labels := stringListFlag{}
 	metadata := stringListFlag{}
 	fs.Var(&labels, "label", "repeatable label")
@@ -85,11 +89,7 @@ func runAdd(args []string, stdout io.Writer) error {
 	if *indexPath == "" {
 		return errors.New("missing --index")
 	}
-	if err := locationindex.SetSpatialCellPrecision(*cellPrecision); err != nil {
-		return err
-	}
-
-	idx, err := loadOrCreateIndex(*indexPath)
+	idx, err := loadOrCreateIndex(*indexPath, locationindex.IndexOptions{SpatialCellPrecision: *cellPrecision, HotSpatialCellThreshold: *hotThreshold})
 	if err != nil {
 		return err
 	}
@@ -143,7 +143,6 @@ func runSearchPrefix(args []string, stdout io.Writer) error {
 	fs.SetOutput(io.Discard)
 	indexPath := fs.String("index", "", "path to index file")
 	prefix := fs.String("prefix", "", "payload prefix")
-	cellPrecision := fs.Uint("cell-precision", locationindex.SpatialCellPrecision(), "spatial cell precision")
 	labels := stringListFlag{}
 	limit := fs.Int("limit", 0, "max records")
 	countExact := fs.Bool("count-exact", false, "compute exact candidate count")
@@ -151,10 +150,6 @@ func runSearchPrefix(args []string, stdout io.Writer) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if err := locationindex.SetSpatialCellPrecision(*cellPrecision); err != nil {
-		return err
-	}
-
 	idx, err := loadIndexRequired(*indexPath)
 	if err != nil {
 		return err
@@ -173,17 +168,12 @@ func runSearchBoundingBox(args []string, stdout io.Writer) error {
 	minLon := fs.Float64("min-lon", 0, "minimum longitude")
 	maxLon := fs.Float64("max-lon", 0, "maximum longitude")
 	precision := fs.Uint("precision", 8, "search precision")
-	cellPrecision := fs.Uint("cell-precision", locationindex.SpatialCellPrecision(), "spatial cell precision")
 	limit := fs.Int("limit", 0, "max records")
 	labels := stringListFlag{}
 	fs.Var(&labels, "label", "repeatable label")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if err := locationindex.SetSpatialCellPrecision(*cellPrecision); err != nil {
-		return err
-	}
-
 	idx, err := loadIndexRequired(*indexPath)
 	if err != nil {
 		return err
@@ -206,17 +196,12 @@ func runSearchRadius(args []string, stdout io.Writer) error {
 	lon := fs.Float64("lon", 0, "longitude")
 	radius := fs.Float64("radius", 0, "radius meters")
 	precision := fs.Uint("precision", 8, "search precision")
-	cellPrecision := fs.Uint("cell-precision", locationindex.SpatialCellPrecision(), "spatial cell precision")
 	limit := fs.Int("limit", 0, "max records")
 	labels := stringListFlag{}
 	fs.Var(&labels, "label", "repeatable label")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if err := locationindex.SetSpatialCellPrecision(*cellPrecision); err != nil {
-		return err
-	}
-
 	idx, err := loadIndexRequired(*indexPath)
 	if err != nil {
 		return err
@@ -237,17 +222,12 @@ func runSearchNearest(args []string, stdout io.Writer) error {
 	indexPath := fs.String("index", "", "path to index file")
 	lat := fs.Float64("lat", 0, "latitude")
 	lon := fs.Float64("lon", 0, "longitude")
-	cellPrecision := fs.Uint("cell-precision", locationindex.SpatialCellPrecision(), "spatial cell precision")
 	limit := fs.Int("limit", 1, "max results")
 	labels := stringListFlag{}
 	fs.Var(&labels, "label", "repeatable label")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if err := locationindex.SetSpatialCellPrecision(*cellPrecision); err != nil {
-		return err
-	}
-
 	idx, err := loadIndexRequired(*indexPath)
 	if err != nil {
 		return err
@@ -257,13 +237,17 @@ func runSearchNearest(args []string, stdout io.Writer) error {
 	return writeJSON(stdout, response)
 }
 
-func loadOrCreateIndex(path string) (*locationindex.LocationIndex, error) {
+func loadOrCreateIndex(path string, options locationindex.IndexOptions) (*locationindex.LocationIndex, error) {
 	idx, err := locationindex.Load(path)
 	if err == nil {
 		return idx, nil
 	}
 	if errors.Is(err, os.ErrNotExist) {
-		return locationindex.NewLocationIndex(), nil
+		idx := locationindex.NewLocationIndexWithOptions(options)
+		if err := idx.ValidateOptions(); err != nil {
+			return nil, err
+		}
+		return idx, nil
 	}
 	return nil, err
 }

@@ -33,7 +33,7 @@ func TestGenerateBuildLoadAndQuery(t *testing.T) {
 		t.Fatalf("built record_count = %v, want 50", built["record_count"])
 	}
 
-	loaded := runBenchCLI(t, "load", "--index", indexPath, "--cell-precision", "14")
+	loaded := runBenchCLI(t, "load", "--index", indexPath)
 	if int(loaded["record_count"].(float64)) != 50 {
 		t.Fatalf("loaded record_count = %v, want 50", loaded["record_count"])
 	}
@@ -41,7 +41,6 @@ func TestGenerateBuildLoadAndQuery(t *testing.T) {
 	queried := runBenchCLI(t,
 		"query",
 		"--index", indexPath,
-		"--cell-precision", "14",
 		"--count", "20",
 		"--mix", "mixed",
 		"--seed", "7",

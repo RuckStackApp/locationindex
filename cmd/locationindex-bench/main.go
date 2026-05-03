@@ -84,23 +84,20 @@ func runBuild(args []string, stdout io.Writer) error {
 	fs.SetOutput(io.Discard)
 	datasetPath := fs.String("dataset", "", "path to dataset jsonl")
 	indexPath := fs.String("index", "", "path to index file")
-	cellPrecision := fs.Uint("cell-precision", locationindex.SpatialCellPrecision(), "spatial cell precision")
+	cellPrecision := fs.Uint("cell-precision", locationindex.DefaultIndexOptions().SpatialCellPrecision, "spatial cell precision")
+	hotThreshold := fs.Int("hot-threshold", locationindex.DefaultIndexOptions().HotSpatialCellThreshold, "hot spatial cell threshold")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *datasetPath == "" || *indexPath == "" {
 		return errors.New("missing --dataset or --index")
 	}
-	if err := locationindex.SetSpatialCellPrecision(*cellPrecision); err != nil {
-		return err
-	}
-
 	records, err := readDataset(*datasetPath)
 	if err != nil {
 		return err
 	}
 
-	result, err := buildIndex(records, *indexPath)
+	result, err := buildIndex(records, *indexPath, locationindex.IndexOptions{SpatialCellPrecision: *cellPrecision, HotSpatialCellThreshold: *hotThreshold})
 	if err != nil {
 		return err
 	}
@@ -113,17 +110,12 @@ func runLoad(args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("load", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	indexPath := fs.String("index", "", "path to index file")
-	cellPrecision := fs.Uint("cell-precision", locationindex.SpatialCellPrecision(), "spatial cell precision")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *indexPath == "" {
 		return errors.New("missing --index")
 	}
-	if err := locationindex.SetSpatialCellPrecision(*cellPrecision); err != nil {
-		return err
-	}
-
 	start := time.Now()
 	idx, err := locationindex.Load(*indexPath)
 	if err != nil {
@@ -149,10 +141,6 @@ func runQuery(args []string, stdout io.Writer) error {
 	if config.Index == "" {
 		return errors.New("missing --index")
 	}
-	if err := locationindex.SetSpatialCellPrecision(config.CellPrecision); err != nil {
-		return err
-	}
-
 	idx, err := locationindex.Load(config.Index)
 	if err != nil {
 		return err
@@ -175,10 +163,6 @@ func runFull(args []string, stdout io.Writer) error {
 	if config.Dataset.Output == "" || config.Query.Index == "" {
 		return errors.New("missing --dataset or --index")
 	}
-	if err := locationindex.SetSpatialCellPrecision(config.Query.CellPrecision); err != nil {
-		return err
-	}
-
 	records, err := generateRecords(config.Dataset)
 	if err != nil {
 		return err
@@ -187,7 +171,7 @@ func runFull(args []string, stdout io.Writer) error {
 		return err
 	}
 
-	buildResult, err := buildIndex(records, config.Query.Index)
+	buildResult, err := buildIndex(records, config.Query.Index, locationindex.IndexOptions{SpatialCellPrecision: config.Query.CellPrecision, HotSpatialCellThreshold: config.Query.HotThreshold})
 	if err != nil {
 		return err
 	}
@@ -239,6 +223,7 @@ type queryConfig struct {
 	Seed          int64
 	Precision     uint
 	CellPrecision uint
+	HotThreshold  int
 	CountExact    bool
 	RadiusM       float64
 	BBoxDelta     float64
@@ -354,7 +339,8 @@ func parseQueryConfig(args []string) (queryConfig, error) {
 	fs.IntVar(&config.Limit, "limit", 20, "result limit")
 	fs.Int64Var(&config.Seed, "seed", 1, "random seed")
 	fs.UintVar(&config.Precision, "precision", 8, "bbox/radius precision")
-	fs.UintVar(&config.CellPrecision, "cell-precision", locationindex.SpatialCellPrecision(), "spatial cell precision")
+	fs.UintVar(&config.CellPrecision, "cell-precision", locationindex.DefaultIndexOptions().SpatialCellPrecision, "spatial cell precision")
+	fs.IntVar(&config.HotThreshold, "hot-threshold", locationindex.DefaultIndexOptions().HotSpatialCellThreshold, "hot spatial cell threshold")
 	fs.BoolVar(&config.CountExact, "count-exact", false, "compute exact candidate counts for prefix queries")
 	fs.Float64Var(&config.RadiusM, "radius-meters", 1000, "radius query size")
 	fs.Float64Var(&config.BBoxDelta, "bbox-delta", 0.02, "half-width in degrees for bbox queries")
@@ -382,7 +368,8 @@ func parseFullConfig(args []string) (fullConfig, error) {
 	fs.StringVar(&config.Query.Mix, "mix", "mixed", "mixed, prefix, bbox, radius, nearest")
 	fs.IntVar(&config.Query.Limit, "limit", 20, "result limit")
 	fs.UintVar(&config.Query.Precision, "precision", 8, "bbox/radius precision")
-	fs.UintVar(&config.Query.CellPrecision, "cell-precision", locationindex.SpatialCellPrecision(), "spatial cell precision")
+	fs.UintVar(&config.Query.CellPrecision, "cell-precision", locationindex.DefaultIndexOptions().SpatialCellPrecision, "spatial cell precision")
+	fs.IntVar(&config.Query.HotThreshold, "hot-threshold", locationindex.DefaultIndexOptions().HotSpatialCellThreshold, "hot spatial cell threshold")
 	fs.BoolVar(&config.Query.CountExact, "count-exact", false, "compute exact candidate counts for prefix queries")
 	fs.Float64Var(&config.Query.RadiusM, "radius-meters", 1000, "radius query size")
 	fs.Float64Var(&config.Query.BBoxDelta, "bbox-delta", 0.02, "half-width in degrees for bbox queries")
@@ -497,8 +484,11 @@ func readDataset(path string) ([]datasetRecord, error) {
 	return records, nil
 }
 
-func buildIndex(records []datasetRecord, indexPath string) (buildResult, error) {
-	idx := locationindex.NewLocationIndex()
+func buildIndex(records []datasetRecord, indexPath string, options locationindex.IndexOptions) (buildResult, error) {
+	idx := locationindex.NewLocationIndexWithOptions(options)
+	if err := idx.ValidateOptions(); err != nil {
+		return buildResult{}, err
+	}
 	buildStart := time.Now()
 	for _, record := range records {
 		labels := make([]locationindex.Label, 0, len(record.Labels))
