@@ -454,6 +454,55 @@ func TestStats(t *testing.T) {
 	}
 }
 
+func TestSnapshotAndRebuild(t *testing.T) {
+	idx := NewLocationIndexWithOptions(IndexOptions{SpatialCellPrecision: 14, HotSpatialCellThreshold: 2})
+	for _, record := range []IndexedRecord{
+		mustRecord(t, "one", 37.7749, -122.4194, 12, []Label{"city"}),
+		mustRecord(t, "two", 34.0522, -118.2437, 12, []Label{"south"}),
+	} {
+		if err := idx.Insert(record); err != nil {
+			t.Fatalf("Insert() error = %v", err)
+		}
+	}
+
+	snapshot := idx.Snapshot()
+	if len(snapshot.Records) != 2 {
+		t.Fatalf("snapshot record count = %d, want 2", len(snapshot.Records))
+	}
+	if snapshot.Options.SpatialCellPrecision != 14 {
+		t.Fatalf("snapshot precision = %d, want 14", snapshot.Options.SpatialCellPrecision)
+	}
+
+	rebuilt, err := RebuildFromSnapshot(snapshot)
+	if err != nil {
+		t.Fatalf("RebuildFromSnapshot() error = %v", err)
+	}
+	if rebuilt.Stats().RecordCount != idx.Stats().RecordCount {
+		t.Fatalf("rebuilt record count = %d, want %d", rebuilt.Stats().RecordCount, idx.Stats().RecordCount)
+	}
+}
+
+func TestClone(t *testing.T) {
+	idx := NewLocationIndex()
+	if err := idx.Insert(mustRecord(t, "one", 37.7749, -122.4194, 12, []Label{"city"})); err != nil {
+		t.Fatalf("Insert() error = %v", err)
+	}
+
+	clone, err := idx.Clone()
+	if err != nil {
+		t.Fatalf("Clone() error = %v", err)
+	}
+	if clone.Stats().RecordCount != idx.Stats().RecordCount {
+		t.Fatalf("clone record count = %d, want %d", clone.Stats().RecordCount, idx.Stats().RecordCount)
+	}
+	if err := clone.Insert(mustRecord(t, "two", 34.0522, -118.2437, 12, []Label{"south"})); err != nil {
+		t.Fatalf("clone Insert() error = %v", err)
+	}
+	if idx.Stats().RecordCount != 1 {
+		t.Fatalf("original record count = %d, want 1", idx.Stats().RecordCount)
+	}
+}
+
 func TestSpatialBitsAndBounds(t *testing.T) {
 	record := mustRecord(t, "sf", 37.7749, -122.4194, 12, nil)
 	decoded, err := locationid.Decode(locationid.New(record.Code))

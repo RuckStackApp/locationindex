@@ -64,6 +64,11 @@ type PrefixSearchResponse struct {
 	Records []IndexedRecord `json:"records"`
 }
 
+type Snapshot struct {
+	Options IndexOptions    `json:"options"`
+	Records []IndexedRecord `json:"records"`
+}
+
 type RecordSearchResponse struct {
 	Stats   SearchStats     `json:"stats"`
 	Records []IndexedRecord `json:"records"`
@@ -316,6 +321,23 @@ func Load(path string) (*LocationIndex, error) {
 	}
 
 	return loadIndex(file, info.Size())
+}
+
+func Open(path string) (*LocationIndex, error) {
+	return Load(path)
+}
+
+func RebuildFromSnapshot(snapshot Snapshot) (*LocationIndex, error) {
+	idx := NewLocationIndexWithOptions(snapshot.Options)
+	if err := idx.ValidateOptions(); err != nil {
+		return nil, err
+	}
+	for _, record := range snapshot.Records {
+		if err := idx.Insert(record); err != nil {
+			return nil, err
+		}
+	}
+	return idx, nil
 }
 
 func prefixes(payload string) []string {
@@ -621,6 +643,25 @@ func (idx *LocationIndex) Save(path string) error {
 		}
 		return file.Sync()
 	})
+}
+
+func (idx *LocationIndex) Snapshot() Snapshot {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	records := make([]IndexedRecord, 0, len(idx.Records))
+	for _, id := range sortedRecordIDsFromDocIDs(idx.recordsByDocID) {
+		records = append(records, idx.Records[id])
+	}
+
+	return Snapshot{
+		Options: idx.Options,
+		Records: records,
+	}
+}
+
+func (idx *LocationIndex) Clone() (*LocationIndex, error) {
+	return RebuildFromSnapshot(idx.Snapshot())
 }
 
 func writeAtomically(path string, write func(file *os.File) error) error {
